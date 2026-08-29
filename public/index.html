@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSS Aggregator</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --border:#2a2e38; --text:#e6e6e6; --muted:#8b93a7; --accent:#4f9cf9; --err:#e5484d; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:22px; margin-bottom:16px; }
+  h2 { font-size:15px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin:24px 0 8px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  input, select { background:var(--card); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:8px 12px; font:inherit; }
+  input[type=url] { flex:1; min-width:240px; }
+  button { background:var(--accent); border:0; color:#fff; border-radius:8px; padding:8px 14px; font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--muted); }
+  button:hover { filter:brightness(1.1); }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px 14px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .card .meta { font-size:12.5px; color:var(--muted); }
+  .card .err { color:var(--err); }
+  .item { display:block; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px 14px; margin-bottom:8px; text-decoration:none; color:var(--text); }
+  .item:hover { border-color:var(--accent); }
+  .item .src { font-size:12px; color:var(--accent); }
+  .item .date { font-size:12px; color:var(--muted); float:right; }
+  .empty { color:var(--muted); padding:12px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RSS Aggregator</h1>
+  <div class="row">
+    <input type="url" id="feedUrl" placeholder="https://example.com/feed.xml" required>
+    <input type="text" id="feedName" placeholder="Name (optional)">
+    <button id="addBtn">Feed hinzufügen</button>
+    <button id="refreshBtn" class="ghost">Aktualisieren</button>
+  </div>
+
+  <h2>Feeds</h2>
+  <div id="feeds"><div class="empty">Noch keine Feeds.</div></div>
+
+  <h2>Artikel <select id="sourceFilter"><option value="">Alle Quellen</option></select></h2>
+  <div id="items"><div class="empty">Noch keine Artikel.</div></div>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.status);
+  return data;
+}
+
+async function loadFeeds() {
+  const feeds = await api('/api/feeds');
+  const box = $('#feeds');
+  const filter = $('#sourceFilter');
+  const current = filter.value;
+  filter.innerHTML = '<option value="">Alle Quellen</option>' +
+    feeds.map(f => `<option${f.name === current ? ' selected' : ''}>${esc(f.name)}</option>`).join('');
+  box.innerHTML = feeds.length ? feeds.map(f => `
+    <div class="card">
+      <div>
+        <strong>${esc(f.name)}</strong>
+        <div class="meta">${esc(f.url)} · ${f.itemCount || 0} Artikel
+          ${f.lastError ? `<span class="err">· Fehler: ${esc(f.lastError)}</span>` : ''}
+        </div>
+      </div>
+      <button class="ghost" data-del="${f.id}">Entfernen</button>
+    </div>`).join('') : '<div class="empty">Noch keine Feeds.</div>';
+  box.querySelectorAll('[data-del]').forEach(b =>
+    b.onclick = async () => { await api('/api/feeds/' + b.dataset.del, { method: 'DELETE' }); refresh(); });
+}
+
+async function loadItems() {
+  const src = $('#sourceFilter').value;
+  const items = await api('/api/items?limit=200' + (src ? '&source=' + encodeURIComponent(src) : ''));
+  $('#items').innerHTML = items.length ? items.map(i => `
+    <a class="item" href="${esc(i.link)}" target="_blank" rel="noopener">
+      <span class="date">${new Date(i.date).toLocaleString('de-CH')}</span>
+      <span class="src">${esc(i.source)}</span><br>${esc(i.title)}
+    </a>`).join('') : '<div class="empty">Noch keine Artikel.</div>';
+}
+
+async function refresh() { await loadFeeds(); await loadItems(); }
+
+$('#addBtn').onclick = async () => {
+  const url = $('#feedUrl').value.trim();
+  if (!url) return;
+  try {
+    await api('/api/feeds', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url, name: $('#feedName').value.trim() || undefined }) });
+    $('#feedUrl').value = ''; $('#feedName').value = '';
+    setTimeout(refresh, 1500);
+    refresh();
+  } catch (e) { alert('Fehler: ' + e.message); }
+};
+$('#refreshBtn').onclick = async () => { await api('/api/refresh', { method: 'POST' }); refresh(); };
+$('#sourceFilter').onchange = loadItems;
+refresh();
+</script>
+</body>
+</html>
