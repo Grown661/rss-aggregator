@@ -46,6 +46,13 @@
 <script>
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// Feed-Links kommen aus fremden Feeds: nur http/https/relativ zulassen, sonst neutralisieren.
+const safeHref = (s) => {
+  const url = String(s || '').trim();
+  if (/^https?:\/\//i.test(url)) return url;          // absolut http/https
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) return url || '#'; // relativ (kein Schema)
+  return '#';                                          // javascript:, data:, etc.
+};
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -79,7 +86,7 @@ async function loadItems() {
   const src = $('#sourceFilter').value;
   const items = await api('/api/items?limit=200' + (src ? '&source=' + encodeURIComponent(src) : ''));
   $('#items').innerHTML = items.length ? items.map(i => `
-    <a class="item" href="${esc(i.link)}" target="_blank" rel="noopener">
+    <a class="item" href="${esc(safeHref(i.link))}" target="_blank" rel="noopener">
       <span class="date">${new Date(i.date).toLocaleString('de-CH')}</span>
       <span class="src">${esc(i.source)}</span><br>${esc(i.title)}
     </a>`).join('') : '<div class="empty">Noch keine Artikel.</div>';

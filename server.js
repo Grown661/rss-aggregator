@@ -4,6 +4,8 @@ const http = require('node:http');
 const https = require('node:https');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const dns = require('node:dns').promises;
+const net = require('node:net');
 const { URL } = require('node:url');
 
 const PORT = Number(process.env.PORT) || 8220;
@@ -29,8 +31,52 @@ async function saveStore() {
   await fsp.writeFile(STORE_FILE, JSON.stringify(store, null, 2));
 }
 
+/* ---------- SSRF-Schutz: nur oeffentliche Ziele ---------- */
+function isPrivateIp(ip) {
+  if (net.isIP(ip) === 4) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 0 || a === 127 || a === 10) return true;          // 0/8, 127/8, 10/8
+    if (a === 172 && b >= 16 && b <= 31) return true;           // 172.16/12
+    if (a === 192 && b === 168) return true;                    // 192.168/16
+    if (a === 169 && b === 254) return true;                    // 169.254/16
+    return false;
+  }
+  const v6 = ip.toLowerCase();
+  if (v6 === '::1' || v6 === '::') return true;                 // Loopback/unspecified
+  if (v6.startsWith('fc') || v6.startsWith('fd')) return true;  // fc00::/7 (ULA)
+  if (/^fe[89ab]/.test(v6)) return true;                        // fe80::/10 (link-local)
+  if (v6.startsWith('::ffff:')) return isPrivateIp(v6.slice(7)); // IPv4-mapped
+  return false;
+}
+
+async function assertPublicUrl(url) {
+  const u = new URL(url);
+  if (!/^https?:$/.test(u.protocol)) throw new Error('Nur http/https erlaubt');
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (host.toLowerCase() === 'localhost' || host.toLowerCase().endsWith('.localhost')) {
+    throw new Error('Blockierte Adresse: ' + host);
+  }
+  if (net.isIP(host)) {
+    if (isPrivateIp(host)) throw new Error('Blockierte Adresse: ' + host);
+    return;
+  }
+  let addrs;
+  try {
+    addrs = await dns.lookup(host, { all: true, verbatim: true });
+  } catch {
+    throw new Error('DNS-Aufloesung fehlgeschlagen: ' + host);
+  }
+  if (!addrs.length) throw new Error('DNS-Aufloesung leer: ' + host);
+  for (const { address } of addrs) {
+    if (isPrivateIp(address)) throw new Error('Blockierte Adresse: ' + host + ' -> ' + address);
+  }
+}
+
 /* ---------- HTTP-Fetch mit Redirect-Handling ---------- */
-function fetchUrl(url, redirectsLeft = 5) {
+const MAX_FEED_BYTES = 5 * 1024 * 1024; // 5 MB
+
+async function fetchUrl(url, redirectsLeft = 5) {
+  await assertPublicUrl(url); // gilt auch fuer jedes Redirect-Ziel
   return new Promise((resolve, reject) => {
     let mod;
     if (url.startsWith('https:')) mod = https;
@@ -51,7 +97,15 @@ function fetchUrl(url, redirectsLeft = 5) {
         return reject(new Error('HTTP ' + res.statusCode));
       }
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > MAX_FEED_BYTES) {
+          req.destroy(new Error('Feed zu gross (max 5 MB)'));
+          return;
+        }
+        chunks.push(c);
+      });
       res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
       res.on('error', reject);
     });
