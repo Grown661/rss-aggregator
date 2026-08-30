@@ -26,29 +26,46 @@ async function loadStore() {
   } catch { /* frischer Start */ }
 }
 
-async function saveStore() {
-  await fsp.mkdir(DATA_DIR, { recursive: true });
-  await fsp.writeFile(STORE_FILE, JSON.stringify(store, null, 2));
+// Writes serialisieren (refreshAll + POST /api/feeds koennen sonst gleichzeitig
+// schreiben) und atomar schreiben (tmp + rename): nie halbe store.json auf Disk.
+let writeChain = Promise.resolve();
+function saveStore() {
+  writeChain = writeChain
+    .then(async () => {
+      await fsp.mkdir(DATA_DIR, { recursive: true });
+      const tmp = STORE_FILE + '.tmp';
+      await fsp.writeFile(tmp, JSON.stringify(store, null, 2));
+      await fsp.rename(tmp, STORE_FILE);
+    })
+    .catch((e) => console.error('saveStore:', e.message));
+  return writeChain;
 }
 
-/* ---------- SSRF-Schutz: nur oeffentliche Ziele ---------- */
+/* ---------- SSRF-Schutz: nur oeffentliche Ziele (net.BlockList) ---------- */
+// net.BlockList statt manueller Range-Pruefung: BlockList normalisiert auch
+// IPv4-mapped IPv6 in HEX-Form (::ffff:7f00:1) und matcht sie gegen die
+// IPv4-Subnets — die manuelle Pruefung erkannte nur die Punktform.
+const PRIVATE_BLOCKLIST = new net.BlockList();
+PRIVATE_BLOCKLIST.addSubnet('0.0.0.0', 8, 'ipv4');      // "this network"
+PRIVATE_BLOCKLIST.addSubnet('10.0.0.0', 8, 'ipv4');     // privat
+PRIVATE_BLOCKLIST.addSubnet('127.0.0.0', 8, 'ipv4');    // loopback
+PRIVATE_BLOCKLIST.addSubnet('169.254.0.0', 16, 'ipv4'); // link-local
+PRIVATE_BLOCKLIST.addSubnet('172.16.0.0', 12, 'ipv4');  // privat
+PRIVATE_BLOCKLIST.addSubnet('192.168.0.0', 16, 'ipv4'); // privat
+PRIVATE_BLOCKLIST.addAddress('::', 'ipv6');             // unspecified
+PRIVATE_BLOCKLIST.addSubnet('::1', 128, 'ipv6');        // loopback
+PRIVATE_BLOCKLIST.addSubnet('fc00::', 7, 'ipv6');       // ULA
+PRIVATE_BLOCKLIST.addSubnet('fe80::', 10, 'ipv6');      // link-local
+
 function isPrivateIp(ip) {
-  if (net.isIP(ip) === 4) {
-    const [a, b] = ip.split('.').map(Number);
-    if (a === 0 || a === 127 || a === 10) return true;          // 0/8, 127/8, 10/8
-    if (a === 172 && b >= 16 && b <= 31) return true;           // 172.16/12
-    if (a === 192 && b === 168) return true;                    // 192.168/16
-    if (a === 169 && b === 254) return true;                    // 169.254/16
-    return false;
-  }
-  const v6 = ip.toLowerCase();
-  if (v6 === '::1' || v6 === '::') return true;                 // Loopback/unspecified
-  if (v6.startsWith('fc') || v6.startsWith('fd')) return true;  // fc00::/7 (ULA)
-  if (/^fe[89ab]/.test(v6)) return true;                        // fe80::/10 (link-local)
-  if (v6.startsWith('::ffff:')) return isPrivateIp(v6.slice(7)); // IPv4-mapped
-  return false;
+  const family = net.isIP(ip);
+  if (family === 0) return true; // unbekanntes Format -> sicherheitshalber blocken
+  return PRIVATE_BLOCKLIST.check(ip, family === 6 ? 'ipv6' : 'ipv4');
 }
 
+// Wirft bei nicht-oeffentlichem Ziel. Gibt die geprueften Daten zurueck, inkl.
+// einer lookup-Funktion, die genau die geprueften IP PINNT — der eigentliche
+// Request darf kein zweites DNS-Lookup machen (DNS-Rebinding/TOCTOU).
 async function assertPublicUrl(url) {
   const u = new URL(url);
   if (!/^https?:$/.test(u.protocol)) throw new Error('Nur http/https erlaubt');
@@ -56,33 +73,44 @@ async function assertPublicUrl(url) {
   if (host.toLowerCase() === 'localhost' || host.toLowerCase().endsWith('.localhost')) {
     throw new Error('Blockierte Adresse: ' + host);
   }
-  if (net.isIP(host)) {
-    if (isPrivateIp(host)) throw new Error('Blockierte Adresse: ' + host);
-    return;
-  }
   let addrs;
-  try {
-    addrs = await dns.lookup(host, { all: true, verbatim: true });
-  } catch {
-    throw new Error('DNS-Aufloesung fehlgeschlagen: ' + host);
+  if (net.isIP(host)) {
+    addrs = [{ address: host, family: net.isIP(host) }];
+  } else {
+    try {
+      addrs = await dns.lookup(host, { all: true, verbatim: true });
+    } catch {
+      throw new Error('DNS-Aufloesung fehlgeschlagen: ' + host);
+    }
   }
   if (!addrs.length) throw new Error('DNS-Aufloesung leer: ' + host);
   for (const { address } of addrs) {
     if (isPrivateIp(address)) throw new Error('Blockierte Adresse: ' + host + ' -> ' + address);
   }
+  const pinned = addrs[0];
+  const family = pinned.family || net.isIP(pinned.address);
+  const lookup = (hostname, options, cb) => {
+    if (typeof options === 'function') { cb = options; options = {}; }
+    if (options && options.all) cb(null, [{ address: pinned.address, family }]);
+    else cb(null, pinned.address, family);
+  };
+  return { url: u, address: pinned.address, family, lookup };
 }
 
 /* ---------- HTTP-Fetch mit Redirect-Handling ---------- */
 const MAX_FEED_BYTES = 5 * 1024 * 1024; // 5 MB
 
 async function fetchUrl(url, redirectsLeft = 5) {
-  await assertPublicUrl(url); // gilt auch fuer jedes Redirect-Ziel
+  // gilt auch fuer jedes Redirect-Ziel; die geprüfte IP wird unten per
+  // lookup-Option gepinnt (kein zweites DNS-Lookup -> kein Rebinding-Fenster)
+  const pinned = await assertPublicUrl(url);
   return new Promise((resolve, reject) => {
     let mod;
     if (url.startsWith('https:')) mod = https;
     else if (url.startsWith('http:')) mod = http;
     else return reject(new Error('Unsupported protocol'));
     const req = mod.get(url, {
+      lookup: pinned.lookup,
       headers: {
         'user-agent': 'rss-aggregator/1.0 (+https://github.com)',
         accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml, */*',
