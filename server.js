@@ -242,6 +242,9 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/feeds' && req.method === 'POST') {
       let body;
       try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'Ungueltiges JSON' }); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return json(res, 400, { error: 'JSON-Objekt erwartet' });
+      }
       let parsed;
       try { parsed = new URL(body.url); } catch { return json(res, 400, { error: 'Ungueltige URL' }); }
       if (!/^https?:$/.test(parsed.protocol)) return json(res, 400, { error: 'Nur http/https' });
@@ -276,7 +279,8 @@ const server = http.createServer(async (req, res) => {
     }
     json(res, 404, { error: 'Nicht gefunden' });
   } catch (err) {
-    json(res, 500, { error: String(err.message || err) });
+    console.error('request error:', err);
+    json(res, 500, { error: 'internal server error' });
   }
 });
 
